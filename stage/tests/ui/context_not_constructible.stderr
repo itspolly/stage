@@ -1,0 +1,10 @@
+error[E0624]: associated function `new` is private
+ --> tests/ui/context_not_constructible.rs:5:43
+  |
+5 |     let _ctx = stage::ActorContext::<u8>::new();
+  |                                           ^^^ private associated function
+  |
+ ::: src/context.rs
+  |
+  |     pub(crate) fn new() -> Self {
+  |     --------------------------- private associated function defined here

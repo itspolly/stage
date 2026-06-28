@@ -1,0 +1,13 @@
+error[E0599]: no method named `increment` found for mutable reference `&mut Counter` in the current scope
+  --> tests/ui/ordinary_async_fn.rs:31:13
+   |
+31 |     counter.increment().await;
+   |             ^^^^^^^^^ method not found in `&mut Counter`
+   |
+   = help: items from traits can only be used if the trait is implemented and in scope
+note: `__StageMethods_Counter` defines an item `increment`, perhaps you need to implement it
+  --> tests/ui/ordinary_async_fn.rs:20:1
+   |
+20 | #[stage::actor]
+   | ^^^^^^^^^^^^^^^
+   = note: this error originates in the attribute macro `stage::actor` (in Nightly builds, run with -Z macro-backtrace for more info)
