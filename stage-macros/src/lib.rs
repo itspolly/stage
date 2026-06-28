@@ -4,23 +4,19 @@
 //! * `#[stage::actor]` on an **impl block** lowers each async `self`-method into
 //!   an `ActorContext`-based body and generates the corresponding
 //!   `ActorRef<T>::method` that schedules it.
-//! * `#[stage::actor_fn]` turns a free `async fn` into a schedulable helper
-//!   invoked as `name(&actor_ref, ..)`. Two forms, by the first parameter:
-//!   * **with `ctx`** — `async fn helper(ctx: ActorContext<'_, A>, ..)` reads
-//!     actor state. May take only `ctx`, and may be generic over the actor type
-//!     (`helper<A: Trait>(ctx: ActorContext<'_, A>)`) for reuse across actors.
-//!   * **without `ctx`** — `async fn work(..)` (no `ActorContext`) runs *on* an
-//!     actor (its token + reentrancy) but never reads actor state. It is made
-//!     generic over the actor type, so `work(&any_actor, ..)` runs it on any
-//!     actor. (This is the named-helper equivalent of `stage::run_on`.)
+//! * `#[stage::actor_fn]` turns a free `async fn(ctx: ActorContext<'_, A>, ..)`
+//!   into a schedulable helper invoked as `name(&actor_ref, ..)`. The helper may
+//!   take only `ctx`, and may be generic over the actor type
+//!   (`async fn helper<A: Trait>(ctx: ActorContext<'_, A>)`) so one helper can be
+//!   reused from multiple distinct actors.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
 use std::collections::HashSet;
 use syn::visit_mut::VisitMut;
 use syn::{
-    parse_macro_input, parse_quote, Expr, FnArg, GenericArgument, GenericParam, Ident, ImplItem,
-    ImplItemFn, Item, ItemFn, ItemImpl, ItemStruct, Pat, PathArguments, ReturnType, Type,
+    parse_macro_input, parse_quote, Expr, FnArg, GenericArgument, Ident, ImplItem, ImplItemFn,
+    Item, ItemFn, ItemImpl, ItemStruct, Pat, PathArguments, ReturnType, Type,
 };
 
 #[proc_macro_attribute]
@@ -213,30 +209,29 @@ pub fn actor_fn(_attr: TokenStream, item: TokenStream) -> TokenStream {
             .into();
     }
 
-    // Two forms, chosen by the first parameter:
-    //   * `ctx: ActorContext<'_, A>` first  -> the helper reads actor state.
-    //   * no such first parameter            -> the helper runs *on* an actor but
-    //                                           does not read its state; it is
-    //                                           generic over the actor type.
-    let has_ctx = matches!(
-        f.sig.inputs.first(),
-        Some(FnArg::Typed(pt)) if extract_actor_ty(&pt.ty).is_some()
-    );
-
-    if has_ctx {
-        actor_fn_with_ctx(f)
-    } else {
-        actor_fn_no_ctx(f)
-    }
-}
-
-/// `#[stage::actor_fn]` where the first parameter is `ctx: ActorContext<'_, A>`.
-fn actor_fn_with_ctx(f: ItemFn) -> TokenStream {
     let first = match f.sig.inputs.first() {
         Some(FnArg::Typed(pt)) => pt.clone(),
-        _ => unreachable!("checked by caller"),
+        _ => {
+            return syn::Error::new_spanned(
+                &f.sig.ident,
+                "#[stage::actor_fn] requires a first parameter `ctx: ActorContext<'_, Actor>`",
+            )
+            .to_compile_error()
+            .into()
+        }
     };
-    let actor_ty = extract_actor_ty(&first.ty).expect("checked by caller");
+
+    let actor_ty = match extract_actor_ty(&first.ty) {
+        Some(t) => t,
+        None => {
+            return syn::Error::new_spanned(
+                &first.ty,
+                "first parameter of #[stage::actor_fn] must be `ActorContext<'_, Actor>`",
+            )
+            .to_compile_error()
+            .into()
+        }
+    };
 
     // The context is dereferenced mutably in the body, so the binding must be
     // `mut` regardless of how the user wrote it.
@@ -259,8 +254,12 @@ fn actor_fn_with_ctx(f: ItemFn) -> TokenStream {
     let lowered_name = format_ident!("__stage_fn_{}", name);
     let body = &f.block;
     let asyncness = &f.sig.asyncness;
+
     let ret = &f.sig.output;
-    let ret_ty = return_type(ret);
+    let ret_ty = match ret {
+        ReturnType::Default => quote! { () },
+        ReturnType::Type(_, t) => quote! { #t },
+    };
 
     let (typed, idents) = split_args(f.sig.inputs.iter().skip(1));
 
@@ -288,66 +287,6 @@ fn actor_fn_with_ctx(f: ItemFn) -> TokenStream {
         }
     }
     .into()
-}
-
-/// `#[stage::actor_fn]` with no `ctx` parameter: the helper runs on an actor
-/// (its token + reentrancy) but never reads or declares actor state. It is made
-/// generic over the actor type, so it can be invoked on any actor:
-/// `work(&some_actor, ..).await`.
-fn actor_fn_no_ctx(f: ItemFn) -> TokenStream {
-    let vis = &f.vis;
-    let name = &f.sig.ident;
-    let lowered_name = format_ident!("__stage_fn_{}", name);
-    let body = &f.block;
-    let asyncness = &f.sig.asyncness;
-    let ret = &f.sig.output;
-    let ret_ty = return_type(ret);
-
-    // Every parameter is an ordinary argument (no ctx to skip).
-    let (typed, idents) = split_args(f.sig.inputs.iter());
-
-    // The lowered body keeps the user's own generics (it never names the actor).
-    let (impl_generics, _ty_generics, where_clause) = f.sig.generics.split_for_impl();
-
-    // The public wrapper additionally takes a fresh actor type parameter and an
-    // `&ActorRef` to schedule on. Insert it after any leading lifetimes.
-    let actor_param = format_ident!("__StageActor");
-    let mut wrapper_generics = f.sig.generics.clone();
-    let new_param: GenericParam = parse_quote!(#actor_param: ::core::marker::Send + 'static);
-    let insert_at = wrapper_generics
-        .params
-        .iter()
-        .take_while(|p| matches!(p, GenericParam::Lifetime(_)))
-        .count();
-    wrapper_generics.params.insert(insert_at, new_param);
-    let (wrapper_impl, _w_ty, wrapper_where) = wrapper_generics.split_for_impl();
-
-    quote! {
-        #[allow(unused, non_snake_case, clippy::all)]
-        #asyncness fn #lowered_name #impl_generics (#(#typed),*) #ret
-        #where_clause
-        #body
-
-        #vis fn #name #wrapper_impl (
-            __actor: &::stage::ActorRef<#actor_param>,
-            #(#typed),*
-        ) -> ::stage::JoinHandle<#ret_ty>
-        #wrapper_where
-        {
-            let __cell = ::stage::ActorRef::__cell(__actor);
-            ::stage::__private::spawn_method(__cell, async move {
-                #lowered_name(#(#idents),*).await
-            })
-        }
-    }
-    .into()
-}
-
-fn return_type(ret: &ReturnType) -> proc_macro2::TokenStream {
-    match ret {
-        ReturnType::Default => quote! { () },
-        ReturnType::Type(_, t) => quote! { #t },
-    }
 }
 
 /// Split typed args into `(param tokens, call-site idents)`.

@@ -123,7 +123,7 @@ serve subsequent invocations. State mutated before the panic persists.
 |------|---------|
 | `#[stage::actor]` on a struct | generates `spawn` / `spawn_on` / `spawn_with` / `spawn_with_on` |
 | `#[stage::actor]` on an impl | lowers async `self`-methods and generates the `ActorRef` methods |
-| `#[stage::actor_fn]` | turns a free `async fn` into a schedulable helper invoked as `name(&actor_ref, ..)`. With a `ctx: ActorContext<'_, A>` first param it reads actor state (may take only `ctx`; may be generic over `A`). With **no** `ctx` it runs on an actor (token + reentrancy) without reading state and is generic over the actor type, so `work(&any_actor, ..)` works — the named-helper form of `run_on` |
+| `#[stage::actor_fn]` | turns a free `async fn(ctx: ActorContext<'_, A>, ..)` into a schedulable helper invoked as `name(&actor_ref, ..)`; may take only `ctx`, and may be generic over the actor type (`fn helper<A: Trait>(ctx: ActorContext<'_, A>)`) for reuse across distinct actors |
 | `stage::run_on(&actor, fut)` | run an ordinary future (no macro, no `ActorContext`) as a continuation in an actor's isolation domain — "may run on an actor" decided at the call site |
 | `ActorRef<A>` | cloneable handle to a spawned actor |
 | `JoinHandle<R>` | awaitable, cancellable handle to a running invocation |
@@ -230,29 +230,20 @@ impl Service {
 
 When the code shouldn't read state but *should* run in some actor's isolation
 domain as its own continuation (e.g. fire-and-forget onto an actor, or from
-outside any actor), use either:
-
-* `stage::run_on(&actor, fut)` — for an ad-hoc future or `async` block, or
-* `#[stage::actor_fn]` **with no `ctx`** — a named, reusable helper. It is
-  generic over the actor type and invoked as `work(&actor, ..)`:
+outside any actor), use `stage::run_on(&actor, fut)`:
 
 ```rust
-#[stage::actor_fn]               // no ActorContext parameter
-async fn warm_up(passes: usize) {
-    for _ in 0..passes { tokio::task::yield_now().await; }
-}
-
-warm_up(&db, 3).await;                          // named form
-stage::run_on(&db, async { /* ... */ }).await;  // ad-hoc form
+stage::run_on(&db, async { /* ... */ }).await;
+async fn warm_up() { for _ in 0..3 { tokio::task::yield_now().await; } }
+stage::run_on(&db, warm_up()).await;
 ```
 
-Both run as a continuation under the actor's token, reentrant at every suspension
-point, but cannot read actor state (there is no `ctx`).
+It runs as a continuation under the actor's token, reentrant at every suspension
+point, but cannot read actor state.
 
-> Note: every `#[stage::actor_fn]`/`run_on` invocation takes an `&ActorRef` —
-> a continuation must be scheduled on *some* actor's token, so there is no
-> "bare" `work()` call. If you want a function callable with no actor at all,
-> that is just a plain `async fn` (need #2).
+> Note: `run_on` takes an `&ActorRef` — a continuation must be scheduled on
+> *some* actor's token. A function callable with no actor at all is just a plain
+> `async fn` (need #2).
 
 ## Tests
 
@@ -266,7 +257,6 @@ The suite in `stage/tests/` covers all 15 success criteria from the brief:
 | `work_stealing.rs` | 10 work stealing |
 | `actor_fn.rs` | 12 `actor_fn` parity |
 | `actor_fn_generic.rs` | `actor_fn` with no extra args; generic over actor type via a trait bound |
-| `actor_fn_no_ctx.rs` | `actor_fn` with no declared `ActorContext`; generic over actor type, reentrant |
 | `compile_fail.rs` + `ui/` | 11 `ActorContext` safety, 13 ordinary-async diagnostic |
 
 ```sh
