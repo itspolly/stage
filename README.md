@@ -190,6 +190,51 @@ cargo test            # run everything
 cargo clippy --all-targets
 ```
 
+## Benchmarks
+
+Two runnable benchmarks (release mode):
+
+```sh
+cargo run --release --example throughput   # scaling across worker counts
+cargo run --release --example vs_tokio      # head-to-head against Tokio
+```
+
+The workload is pure suspend/resume thrash: continuations that `.await` a leaf
+which immediately re-readies them, so each cycle exercises the full reentrancy
+path (release the actor token, re-schedule the continuation, steal/repoll). This
+is the scheduler's worst case — almost no useful work to amortize overhead — and
+exactly the path Stage is built around.
+
+On a 14-core machine, matched independent workload (8192 units × 256 cycles =
+~2.1M scheduler ops), atomic-counter completion:
+
+| threads | Stage Mops/s | Tokio Mops/s |
+|--------:|-------------:|-------------:|
+|       1 |         40.3 |          4.3 |
+|       2 |         88.2 |         32.2 |
+|       4 |        174.2 |         20.9 |
+|       8 |        260.5 |         12.8 |
+
+Stage scales positively to 8 threads; Tokio (which defensively requeues a
+self-waking task behind all others) peaks at 2 threads on this pattern. This is a
+*scheduling* microbenchmark, not a general async-I/O claim — Tokio's reactor
+remains the right tool for real I/O. The point is that Stage's per-continuation
+scheduling is competitive and scales.
+
+Getting here took removing three separate global cache lines from the per-cycle
+hot path, each of which had caused negative multi-thread scaling:
+
+1. `inject` locked a global `Mutex<Vec<Thread>>` to unpark a worker on every
+   schedule → replaced with a lock-free `OnceLock` + parked-worker counter.
+2. `release_token` cloned the `Executor` (`Arc<Shared>`) every cycle → clone the
+   per-actor cell `Arc` instead (its refcount line is worker-owned).
+3. The worker loop called `weak.upgrade()` every iteration (atomic inc/dec on the
+   shared refcount) → workers now hold a strong `Arc<Shared>` and shutdown is
+   driven by an explicit handle counter.
+
+A re-scheduled continuation is also pushed onto the *current* worker's own deque
+(cache-hot, off the contended global queue); idle workers still steal surplus.
+
 ## Research question — conclusion
 
 > Can Rust provide an actor model with semantics comparable to Swift
