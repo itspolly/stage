@@ -51,6 +51,33 @@ async fn run_on_is_reentrant() {
     assert_eq!(task.await, 20);
 }
 
+// Rigorous proof that a *plain* future's `.await` releases the actor token (i.e.
+// reentrancy does not depend on the macro). The future parks on a channel; if the
+// token were held across `.await`, `w.bump()` could never run and the test would
+// deadlock (caught by the timeout).
+#[tokio::test]
+async fn run_on_releases_token_at_suspension() {
+    use tokio::sync::oneshot;
+    use tokio::time::timeout;
+
+    let w = Worker::spawn();
+    let (tx, rx) = oneshot::channel::<()>();
+
+    let task = stage::run_on(&w, async move {
+        rx.await.unwrap(); // parks here, holding the token only if NOT reentrant
+        99
+    });
+
+    // The actor must make progress while the run_on future is parked.
+    timeout(Duration::from_secs(2), w.bump())
+        .await
+        .expect("actor was blocked: the plain future did not release the token");
+    assert_eq!(w.get().await, 1);
+
+    tx.send(()).unwrap(); // let the parked future complete
+    assert_eq!(task.await, 99);
+}
+
 #[tokio::test]
 async fn run_on_accepts_inline_async_block() {
     let w = Worker::spawn();
