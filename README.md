@@ -188,6 +188,72 @@ queued methods may run reentrantly), and on resume the actor pointer is
 re-published. Synchronous helper methods are also callable directly through the
 context's `Deref`.
 
+## Running code on an actor
+
+There are three distinct needs; pick the tool that matches.
+
+### 1. Read or mutate actor state
+
+Use an actor method, or `#[stage::actor_fn]` with a `ctx: ActorContext<'_, A>`
+first parameter (the only thing that grants state access). The helper is invoked
+as `name(&actor, ..)` and may be generic over the actor type:
+
+```rust
+#[stage::actor_fn]
+async fn add<A: Tally>(ctx: ActorContext<'_, A>, n: usize) -> usize {
+    ctx.bump_by(n);          // reads/mutates state via the trait bound
+    ctx.total()
+}
+let t = add(&counter, 5).await;
+```
+
+### 2. Run ordinary code on the *current* actor — no macro needed
+
+A plain `async fn` that doesn't touch actor state needs **nothing special**. When
+you `.await` it inside an actor continuation it runs *on* that actor and is fully
+reentrant (its `.await`s release the token like any other suspension); when you
+`.await` it elsewhere it is an ordinary future. It is callable from any context.
+
+```rust
+async fn fetch_and_parse(url: Url) -> Data { /* ... */ }   // plain async fn
+
+#[stage::actor]
+impl Service {
+    async fn refresh(&mut self, url: Url) {
+        let data = fetch_and_parse(url).await; // runs in this continuation; reentrant
+        self.cache = data;
+    }
+}
+```
+
+### 3. Schedule code as a *new* continuation on a *specific* actor
+
+When the code shouldn't read state but *should* run in some actor's isolation
+domain as its own continuation (e.g. fire-and-forget onto an actor, or from
+outside any actor), use either:
+
+* `stage::run_on(&actor, fut)` — for an ad-hoc future or `async` block, or
+* `#[stage::actor_fn]` **with no `ctx`** — a named, reusable helper. It is
+  generic over the actor type and invoked as `work(&actor, ..)`:
+
+```rust
+#[stage::actor_fn]               // no ActorContext parameter
+async fn warm_up(passes: usize) {
+    for _ in 0..passes { tokio::task::yield_now().await; }
+}
+
+warm_up(&db, 3).await;                          // named form
+stage::run_on(&db, async { /* ... */ }).await;  // ad-hoc form
+```
+
+Both run as a continuation under the actor's token, reentrant at every suspension
+point, but cannot read actor state (there is no `ctx`).
+
+> Note: every `#[stage::actor_fn]`/`run_on` invocation takes an `&ActorRef` —
+> a continuation must be scheduled on *some* actor's token, so there is no
+> "bare" `work()` call. If you want a function callable with no actor at all,
+> that is just a plain `async fn` (need #2).
+
 ## Tests
 
 The suite in `stage/tests/` covers all 15 success criteria from the brief:
