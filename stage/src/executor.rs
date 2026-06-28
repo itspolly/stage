@@ -32,6 +32,7 @@ use crate::cell::AnyCell;
 use crate::context::ActorScope;
 use crossbeam_deque::{Injector, Steal, Stealer, Worker as Deque};
 use parking_lot::Mutex;
+use std::cell::Cell;
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
@@ -40,6 +41,28 @@ use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::Thread;
 use std::time::Duration;
+
+type TaskDeque = Deque<Arc<ContinuationTask>>;
+
+// Identifies the executor and local deque of the worker running on this thread,
+// if any. Lets `inject` push a re-scheduled continuation onto the *current*
+// worker's own queue (cache-hot, no global-queue contention) when the schedule
+// originates from inside that executor's worker. The raw pointer is only ever
+// dereferenced on its owning thread, where the deque outlives every use.
+thread_local! {
+    static CURRENT_WORKER: Cell<Option<(usize, *const TaskDeque)>> = const { Cell::new(None) };
+}
+
+static NEXT_EXECUTOR_ID: AtomicUsize = AtomicUsize::new(1);
+
+/// Clears the `CURRENT_WORKER` thread-local when a worker loop exits (including
+/// via unwind), so a dangling deque pointer can never be observed.
+struct ClearWorkerOnDrop;
+impl Drop for ClearWorkerOnDrop {
+    fn drop(&mut self) {
+        CURRENT_WORKER.with(|c| c.set(None));
+    }
+}
 
 /// One in-flight actor method invocation.
 pub struct ContinuationTask {
@@ -99,10 +122,13 @@ pub fn schedule(task: Arc<ContinuationTask>) {
 fn release_token(cell: &Arc<dyn AnyCell>) {
     let mut sched = cell.sched().lock();
     if let Some(next) = sched.pending.pop_front() {
-        // Token stays held; the next continuation inherits it.
+        // Token stays held; the next continuation inherits it. Clone the cell
+        // Arc (whose refcount line is owned by this worker) rather than the
+        // Executor (whose refcount is shared by all workers) to avoid global
+        // cache-line contention on the hot re-schedule path.
         drop(sched);
-        let executor = next.cell.executor().clone();
-        executor.inject(next);
+        let next_cell = next.cell.clone();
+        next_cell.executor().inject(next);
     } else {
         sched.active = false;
     }
@@ -175,6 +201,7 @@ pub fn run_task(task: Arc<ContinuationTask>) {
 pub struct Executor(Arc<Shared>);
 
 struct Shared {
+    id: usize,
     injector: Injector<Arc<ContinuationTask>>,
     stealers: Vec<Stealer<Arc<ContinuationTask>>>,
     /// Worker thread handles for unparking. Written once, after spawn; read
@@ -227,6 +254,7 @@ impl Executor {
         let stealers = deques.iter().map(|d| d.stealer()).collect();
 
         let shared = Arc::new(Shared {
+            id: NEXT_EXECUTOR_ID.fetch_add(1, Ordering::Relaxed),
             injector: Injector::new(),
             stealers,
             threads: OnceLock::new(),
@@ -236,11 +264,12 @@ impl Executor {
         });
 
         let mut handles = Vec::with_capacity(n);
+        let id = shared.id;
         for (i, deque) in deques.into_iter().enumerate() {
             let weak = Arc::downgrade(&shared);
             let handle = std::thread::Builder::new()
                 .name(format!("stage-worker-{i}"))
-                .spawn(move || worker_loop(weak, deque, i))
+                .spawn(move || worker_loop(weak, deque, i, id))
                 .expect("stage: failed to spawn worker thread");
             handles.push(handle.thread().clone());
         }
@@ -251,12 +280,34 @@ impl Executor {
 
     /// Push a runnable continuation onto this executor and nudge a parked worker.
     pub(crate) fn inject(&self, task: Arc<ContinuationTask>) {
+        // Fast path: if we're running on a worker of *this* executor, push onto
+        // its own local deque. Re-scheduled continuations (the common case) then
+        // stay cache-hot and off the contended global queue; idle workers can
+        // still steal them.
+        let local = CURRENT_WORKER.with(|c| c.get());
+        if let Some((id, deque)) = local {
+            if id == self.0.id {
+                // SAFETY: `deque` points to the local `Deque` owned by this very
+                // thread's worker loop, which is live for the duration of the
+                // loop; we only ever push to it from its owning thread.
+                unsafe { (*deque).push(task) };
+                // Wake an idle worker so it can steal, but only if one is parked.
+                if self.0.parked.load(Ordering::Acquire) > 0 {
+                    self.unpark_one();
+                }
+                return;
+            }
+        }
+
         self.0.injector.push(task);
         // Only pay for an unpark if some worker is actually parked; busy workers
         // will pick the task up via the injector on their next steal.
-        if self.0.parked.load(Ordering::Acquire) == 0 {
-            return;
+        if self.0.parked.load(Ordering::Acquire) > 0 {
+            self.unpark_one();
         }
+    }
+
+    fn unpark_one(&self) {
         if let Some(threads) = self.0.threads.get() {
             let n = threads.len();
             if n > 0 {
@@ -267,10 +318,14 @@ impl Executor {
     }
 }
 
-fn worker_loop(weak: Weak<Shared>, local: Deque<Arc<ContinuationTask>>, idx: usize) {
+fn worker_loop(weak: Weak<Shared>, local: TaskDeque, idx: usize, id: usize) {
     // Enter the shared reactor so leaf futures (timers/I/O) polled on this
     // thread register with it.
     let _enter = reactor().enter();
+    // Publish this worker's executor id + local deque so `inject` can re-schedule
+    // continuations locally. Cleared on exit.
+    CURRENT_WORKER.with(|c| c.set(Some((id, &local as *const TaskDeque))));
+    let _clear = ClearWorkerOnDrop;
     loop {
         let shared = match weak.upgrade() {
             Some(s) => s,
