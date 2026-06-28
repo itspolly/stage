@@ -123,7 +123,7 @@ serve subsequent invocations. State mutated before the panic persists.
 |------|---------|
 | `#[stage::actor]` on a struct | generates `spawn` / `spawn_on` / `spawn_with` / `spawn_with_on` |
 | `#[stage::actor]` on an impl | lowers async `self`-methods and generates the `ActorRef` methods |
-| `#[stage::actor_fn]` | turns a free `async fn(ctx: ActorContext<'_, A>, ..)` into a schedulable helper invoked as `name(&actor_ref, ..)`; may take only `ctx`, and may be generic over the actor type (`fn helper<A: Trait>(ctx: ActorContext<'_, A>)`) for reuse across distinct actors |
+| `#[stage::actor_fn]` | turns a free `async fn` into a schedulable helper invoked as `name(&actor_ref, ..)`. With a `ctx: ActorContext<'_, A>` first param it reads actor state (may take only `ctx`; may be generic over `A`). With **no** `ctx` it runs on an actor (token + reentrancy) without reading state and is generic over the actor type, so `work(&any_actor, ..)` works — the named-helper form of `run_on` |
 | `stage::run_on(&actor, fut)` | run an ordinary future (no macro, no `ActorContext`) as a continuation in an actor's isolation domain — "may run on an actor" decided at the call site |
 | `ActorRef<A>` | cloneable handle to a spawned actor |
 | `JoinHandle<R>` | awaitable, cancellable handle to a running invocation |
@@ -200,6 +200,7 @@ The suite in `stage/tests/` covers all 15 success criteria from the brief:
 | `work_stealing.rs` | 10 work stealing |
 | `actor_fn.rs` | 12 `actor_fn` parity |
 | `actor_fn_generic.rs` | `actor_fn` with no extra args; generic over actor type via a trait bound |
+| `actor_fn_no_ctx.rs` | `actor_fn` with no declared `ActorContext`; generic over actor type, reentrant |
 | `compile_fail.rs` + `ui/` | 11 `ActorContext` safety, 13 ordinary-async diagnostic |
 
 ```sh
