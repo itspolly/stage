@@ -1,8 +1,8 @@
-# Project Brief: Swift-Style Reentrant Actors for Rust
+# Stage — Swift-Style Reentrant Actors for Rust
 
 ## Objective
 
-Design and implement a prototype Rust actor runtime providing semantics similar to Swift actors.
+Design and implement **Stage**, a Rust actor runtime providing semantics similar to Swift actors.
 
 The defining property is **actor reentrancy**:
 
@@ -12,7 +12,31 @@ The defining property is **actor reentrancy**:
 
 The implementation should feel as close as possible to Swift's actor model while remaining idiomatic Rust.
 
-The project is primarily a **research prototype** exploring whether Swift-style actor semantics can be expressed in Rust with excellent ergonomics and competitive performance.
+This project is a **research prototype** exploring whether Swift-style actor semantics can be expressed in Rust while preserving Rust's safety guarantees and ergonomics.
+
+---
+
+# Core Principles
+
+1. **Actor isolation**
+
+   Only one continuation belonging to an actor executes at a time.
+
+2. **Reentrancy**
+
+   Suspension points (`.await`) are the only points where another continuation may enter the actor.
+
+3. **Ordinary Rust syntax**
+
+   Users should write normal Rust methods using `&mut self`.
+
+4. **Type-safe internals**
+
+   Internally, Stage should represent actor execution using an opaque `ActorContext<'_, T>`.
+
+5. **No magic outside Stage**
+
+   Ordinary async Rust should behave exactly as it does today.
 
 ---
 
@@ -20,20 +44,22 @@ The project is primarily a **research prototype** exploring whether Swift-style 
 
 Implement:
 
-* `#[actor]` procedural macro (or another equally ergonomic code-generation approach if necessary)
+* `#[stage::actor]`
+* `#[stage::actor_fn]`
 * Actor runtime
 * Actor executor
-* Generated actor handle (`ActorRef<T>` or similar)
+* Generated `ActorRef<T>`
 * Reentrant scheduling
 * Async actor methods
-* Request/response messaging
+* Async actor helper functions
 * Cross-actor calls
+* Request/response messaging
 * Task cancellation
 * Multiple executors
-* Work-stealing scheduler for load balancing between executors
-* Comprehensive unit tests demonstrating semantics
+* Work-stealing scheduler
+* Comprehensive unit tests
 
-Do **not** initially attempt:
+Out of scope (initially):
 
 * Distributed actors
 * Persistence
@@ -41,14 +67,16 @@ Do **not** initially attempt:
 * Supervision
 * Priority scheduling
 
-The prototype only needs to support a single process.
+Single-process support is sufficient for the prototype.
 
 ---
 
 # Desired API
 
+## Actor definition
+
 ```rust
-#[actor]
+#[stage::actor]
 struct Counter {
     value: usize,
 }
@@ -66,32 +94,105 @@ impl Counter {
         self.value
     }
 }
-
-#[tokio::main]
-async fn main() {
-    let counter = Counter::spawn();
-
-    let task = counter.increment();
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    assert_eq!(counter.get().await, 1);
-
-    task.await;
-
-    assert_eq!(counter.get().await, 2);
-}
 ```
 
-Users should write ordinary async Rust.
+Usage:
 
-They should **not** manually define:
+```rust
+let counter = Counter::spawn();
+
+let task = counter.increment();
+
+tokio::time::sleep(Duration::from_millis(10)).await;
+
+assert_eq!(counter.get().await, 1);
+
+task.await;
+
+assert_eq!(counter.get().await, 2);
+```
+
+Users should **never** manually construct:
 
 * message enums
 * channels
-* custom futures
+* futures
 * state machines
 * schedulers
+* `ActorContext`
+
+---
+
+# Actor Helper Functions
+
+Reusable actor-aware, global helper functions should be supported.
+
+Example:
+
+```rust
+#[stage::actor_fn]
+async fn increment_by(
+    ctx: ActorContext<'_, Counter>,
+    amount: usize,
+) {
+    ctx.value += amount;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    ctx.value += amount;
+}
+```
+
+`ActorContext` is only exposed here because there is no actor method receiver.
+
+It should **not** be required for ordinary actor methods.
+
+---
+
+# Internal Representation
+
+Actor methods should be lowered internally into an implementation using `ActorContext`.
+
+Conceptually:
+
+User code:
+
+```rust
+async fn increment(&mut self)
+```
+
+becomes something equivalent to
+
+```rust
+async fn __stage_increment(
+    ctx: ActorContext<'_, Counter>,
+)
+```
+
+This transformation is an implementation detail.
+
+---
+
+# ActorContext
+
+Stage should expose an opaque type:
+
+```rust
+pub struct ActorContext<'a, A> {
+    // private
+}
+```
+
+Properties:
+
+* exclusive mutable access to actor state while polling
+* cannot be constructed by users
+* cannot be cloned
+* cannot be stored
+* cannot outlive a single poll
+* cannot accidentally be captured by ordinary async futures
+
+`ActorContext` is the primitive abstraction used internally by Stage.
 
 ---
 
@@ -119,23 +220,21 @@ async fn increment(&mut self) {
 }
 ```
 
-another actor method may execute after the suspension begins but before it resumes.
+another actor method may execute after the suspension begins but before execution resumes.
 
-This is the defining behaviour of the runtime.
+This is the defining property of Stage.
 
 ---
 
 ## No mutable borrow across suspension
 
-The implementation must **not** retain `&mut Actor` inside a suspended future.
+The runtime must **never** retain `&mut Actor` across suspension.
 
 Instead:
 
-* acquire mutable access while polling
-* release mutable access when returning `Poll::Pending`
-* reacquire mutable access on the next poll
-
-This property enables actor reentrancy.
+* acquire actor access while polling
+* release actor access when returning `Poll::Pending`
+* reacquire actor access on the next poll
 
 ---
 
@@ -149,58 +248,56 @@ When a continuation becomes ready via its waker, it is appended to the ready que
 
 ## Await transparency
 
-Users should write ordinary async functions.
+Users write ordinary async methods.
 
-No explicit yield, resume, requeue or scheduling APIs should be required.
+No explicit yield/resume APIs should exist.
 
 ---
 
 ## Cross-actor calls
 
-Actors should be able to invoke async methods on other actors naturally.
+Actors should naturally invoke methods on other actors.
 
 Example:
 
 ```rust
-#[actor]
+#[stage::actor]
 struct Database;
 
-#[actor]
+#[stage::actor]
 struct Service;
 
 impl Service {
-    async fn request(&mut self, db: &ActorRef<Database>) {
-        db.query().await;
+    async fn query(&mut self, db: &ActorRef<Database>) {
+        db.fetch().await;
     }
 }
 ```
 
-While awaiting another actor:
+Requirements:
 
-* execution of the current actor is released
-* unrelated actor work may continue
-* unnecessary deadlocks should be avoided
+* current actor releases execution while awaiting
+* unrelated actor work continues
+* deadlocks are avoided where possible
 
 ---
 
 ## Cancellation
 
-Actor method invocations should be cancellable.
+Actor invocations are cancellable.
 
 Cancellation must:
 
-* never leave actor state inconsistent
-* never violate actor isolation
-* correctly clean up suspended continuations
-* have well-defined behaviour while suspended
-
-Cancellation semantics must be documented and tested.
+* preserve actor consistency
+* preserve isolation
+* clean up suspended continuations
+* have deterministic semantics
 
 ---
 
 ## Multiple executors
 
-The runtime should support multiple independent executors.
+Support multiple executors.
 
 Example:
 
@@ -208,14 +305,14 @@ Example:
 let io = Executor::new();
 let ui = Executor::new();
 
-let database = Database::spawn_on(&io);
+let db = Database::spawn_on(&io);
 let window = Window::spawn_on(&ui);
 ```
 
 Requirements:
 
-* actors execute only on the executor they were spawned onto
-* cross-executor actor calls function transparently
+* actors execute only on their assigned executor
+* cross-executor actor calls work transparently
 * actor isolation is preserved
 
 ---
@@ -226,35 +323,75 @@ Executors should balance work using work stealing.
 
 Requirements:
 
-* work stealing must never violate actor isolation
-* at most one continuation belonging to an actor executes at once
-* continuations may migrate between worker threads within an executor if safe
-* executor affinity must be preserved
-* scheduling policy should be documented
+* actor isolation is never violated
+* continuations are the schedulable unit
+* continuations may migrate between worker threads within an executor
+* executor affinity is preserved
+* scheduling policy is documented
 
-The schedulable unit should be **actor continuations**, not actors themselves.
+Actors themselves are **not** scheduled.
+
+Continuations are.
+
+---
+
+## Ordinary async functions
+
+Ordinary async functions remain ordinary Rust.
+
+Example:
+
+```rust
+async fn helper(counter: &mut Counter) {
+    ...
+}
+```
+
+These functions **must not** participate in actor lowering.
+
+If an ordinary async function would retain actor state across suspension, Stage should emit a compile-time diagnostic.
+
+Example:
+
+```text
+error:
+
+ordinary async function captures actor state across suspension
+
+help:
+
+move this function into the actor implementation
+
+or annotate it with
+
+    #[stage::actor_fn]
+```
 
 ---
 
 # Suggested Architecture
 
 ```text
-actor-runtime/
+stage/
 
     Executor
     Worker
-    ActorExecutor
-    ActorRef<T>
-    ActorCell<T>
-    ActorFuture<T>
     Scheduler
 
-actor-macros/
+    ActorExecutor
+    ActorCell<T>
+    ActorRef<T>
+    ActorContext<T>
 
-    #[actor]
+    ActorFuture<T>
+
+stage-macros/
+
+    #[stage::actor]
+    #[stage::actor_fn]
 ```
 
-Suggested polling trait:
+Suggested polling interface:
 
 ```rust
 trait ActorFuture<A> {
@@ -268,13 +405,11 @@ trait ActorFuture<A> {
 }
 ```
 
-The actor is supplied during polling rather than captured by the future.
+The actor is supplied during polling rather than stored inside the future.
 
 ---
 
 # Success Criteria
-
-The following tests must all pass.
 
 ## Test 1 — Simple invocation
 
@@ -303,7 +438,7 @@ value == 4
 
 ## Test 3 — Reentrancy
 
-```text
+```
 increment()
 
 ...suspends...
@@ -313,7 +448,7 @@ get()
 
 Expected:
 
-```text
+```
 get() == 1
 ```
 
@@ -323,9 +458,9 @@ This is the defining behavioural test.
 
 ## Test 4 — Multiple suspended continuations
 
-Queue
+Queue:
 
-```text
+```
 increment()
 increment()
 increment()
@@ -333,9 +468,9 @@ increment()
 
 All suspend.
 
-When resumed:
+After waking:
 
-```text
+```
 value == 6
 ```
 
@@ -356,11 +491,7 @@ Verify:
 
 ## Test 6 — Cross-actor call
 
-```
-Actor A
-    ↓ await
-Actor B
-```
+Actor A awaits Actor B.
 
 Verify:
 
@@ -372,7 +503,7 @@ Verify:
 
 ## Test 7 — Mutual actor calls
 
-Two actors call one another while suspending.
+Two actors await one another.
 
 Verify:
 
@@ -384,26 +515,26 @@ Verify:
 
 ## Test 8 — Cancellation
 
-Cancel an actor invocation before completion.
+Cancel an actor invocation.
 
 Verify:
 
 * actor remains usable
 * no leaked continuations
-* no inconsistent state
-* subsequent messages execute correctly
+* consistent state
+* later messages execute correctly
 
 ---
 
 ## Test 9 — Multiple executors
 
-Spawn actors onto different executors.
+Spawn actors on different executors.
 
 Verify:
 
-* actors execute only on their assigned executor
-* cross-executor calls function correctly
-* actor isolation remains intact
+* executor affinity
+* transparent cross-executor calls
+* actor isolation
 
 ---
 
@@ -413,14 +544,48 @@ Create many actors with many suspended continuations.
 
 Verify:
 
-* idle workers successfully steal work
-* throughput improves compared to a single worker
+* idle workers steal continuations
+* throughput improves
 * no actor executes multiple continuations simultaneously
 * actor state remains correct
 
 ---
 
-## Test 11 — Large queue
+## Test 11 — ActorContext safety
+
+Verify `ActorContext`:
+
+* cannot be cloned
+* cannot be stored
+* cannot escape
+* cannot be retained across suspension outside Stage
+* cannot be moved into an ordinary async future
+
+Invalid usage should fail to compile.
+
+---
+
+## Test 12 — actor_fn
+
+Verify that a `#[stage::actor_fn]` exhibits identical scheduling and reentrancy semantics to an actor method.
+
+---
+
+## Test 13 — Compile-time diagnostics
+
+Attempt:
+
+```rust
+async fn helper(counter: &mut Counter) {
+    tokio::time::sleep(...).await;
+}
+```
+
+Expect a compile-time diagnostic explaining why actor state cannot be retained across suspension and suggesting `#[stage::actor_fn]`.
+
+---
+
+## Test 14 — Large queue
 
 Queue 100,000 actor invocations.
 
@@ -428,16 +593,16 @@ Verify:
 
 * completion
 * FIFO ordering
-* no leaks
 * stable memory usage
+* no leaks
 
 ---
 
-## Test 12 — Panic isolation
+## Test 15 — Panic isolation
 
 A panic inside one actor invocation must not corrupt executor state.
 
-Subsequent actor invocations should either continue correctly (if supported) or fail in a documented and deterministic manner.
+Subsequent actor invocations should either continue correctly or fail in a documented and deterministic manner.
 
 ---
 
@@ -446,10 +611,8 @@ Subsequent actor invocations should either continue correctly (if supported) or 
 * Return values
 * Async streams
 * Actor timers
-* Supervision
-* Priority queues
-* Bounded mailboxes
-* Metrics and tracing
+* Metrics
+* Tracing
 * Deterministic testing utilities
 * Distributed actors
 * Persistence
@@ -458,7 +621,6 @@ Subsequent actor invocations should either continue correctly (if supported) or 
 
 # Research Question
 
-Can Rust provide an actor programming model with semantics comparable to Swift actors—including reentrancy, isolation, cancellation, cross-actor calls, multiple executors, executor affinity, and work-stealing scheduling—while preserving Rust's safety guarantees and allowing developers to write ordinary async methods without manually constructing state machines?
+Can Rust provide an actor programming model with semantics comparable to Swift actors—including reentrancy, isolation, cancellation, cross-actor calls, multiple executors, executor affinity, and work-stealing scheduling—while preserving Rust's safety guarantees and allowing developers to write ordinary async methods?
 
-A successful prototype should demonstrate that Swift-style actor semantics are achievable in Rust through a combination of runtime support and code generation while remaining ergonomic, performant, and memory safe.
-
+A successful prototype should demonstrate that Swift-style actor semantics are achievable in Rust through a combination of runtime support and code generation while remaining ergonomic, performant, memory safe, and idiomatic.
