@@ -37,7 +37,7 @@ use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::Thread;
 use std::time::Duration;
@@ -210,12 +210,18 @@ struct Shared {
     /// Number of workers currently parked, so inject can skip the unpark syscall
     /// when everyone is already busy.
     parked: AtomicUsize,
+    /// Number of live user-facing `Executor` handles (Executor clones, including
+    /// those held inside actor cells). When it hits zero we signal shutdown.
+    /// Workers hold their own strong `Arc<Shared>` so they do NOT touch this on
+    /// the hot path — avoiding global refcount contention every loop iteration.
+    handles: AtomicUsize,
     next: AtomicUsize,
     shutdown: AtomicBool,
 }
 
 impl Clone for Executor {
     fn clone(&self) -> Self {
+        self.0.handles.fetch_add(1, Ordering::Relaxed);
         Executor(self.0.clone())
     }
 }
@@ -226,12 +232,17 @@ impl Default for Executor {
     }
 }
 
-impl Drop for Shared {
+impl Drop for Executor {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
-        if let Some(threads) = self.threads.get() {
-            for t in threads {
-                t.unpark();
+        // Last user-facing handle gone: tell the workers to exit and wake them.
+        // They hold their own strong Arc<Shared>, so Shared is freed once they
+        // observe the flag and drop those refs.
+        if self.0.handles.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.shutdown.store(true, Ordering::Release);
+            if let Some(threads) = self.0.threads.get() {
+                for t in threads {
+                    t.unpark();
+                }
             }
         }
     }
@@ -259,6 +270,7 @@ impl Executor {
             stealers,
             threads: OnceLock::new(),
             parked: AtomicUsize::new(0),
+            handles: AtomicUsize::new(1),
             next: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
         });
@@ -266,10 +278,12 @@ impl Executor {
         let mut handles = Vec::with_capacity(n);
         let id = shared.id;
         for (i, deque) in deques.into_iter().enumerate() {
-            let weak = Arc::downgrade(&shared);
+            // Each worker owns a strong Arc<Shared> for its lifetime, so the hot
+            // loop never touches the shared refcount.
+            let shared = shared.clone();
             let handle = std::thread::Builder::new()
                 .name(format!("stage-worker-{i}"))
-                .spawn(move || worker_loop(weak, deque, i, id))
+                .spawn(move || worker_loop(shared, deque, i, id))
                 .expect("stage: failed to spawn worker thread");
             handles.push(handle.thread().clone());
         }
@@ -285,23 +299,26 @@ impl Executor {
         // stay cache-hot and off the contended global queue; idle workers can
         // still steal them.
         let local = CURRENT_WORKER.with(|c| c.get());
-        if let Some((id, deque)) = local {
-            if id == self.0.id {
-                // SAFETY: `deque` points to the local `Deque` owned by this very
-                // thread's worker loop, which is live for the duration of the
-                // loop; we only ever push to it from its owning thread.
-                unsafe { (*deque).push(task) };
-                // Wake an idle worker so it can steal, but only if one is parked.
-                if self.0.parked.load(Ordering::Acquire) > 0 {
-                    self.unpark_one();
-                }
-                return;
-            }
+        if let Some((id, deque)) = local
+            && id == self.0.id
+        {
+            // SAFETY: `deque` points to the local `Deque` owned by this very
+            // thread's worker loop, which is live for the duration of the
+            // loop; we only ever push to it from its owning thread.
+            unsafe { (*deque).push(task) };
+            // Do NOT unpark here. This worker is actively running and will
+            // process the task itself; idle workers steal surplus via their
+            // periodic re-check. Unparking on every local re-schedule causes
+            // an unpark-syscall storm whenever any worker is parked (e.g. the
+            // staggered endgame), which is what made the thrash workload
+            // scale negatively.
+            return;
         }
 
+        // External / cross-thread wake (e.g. a timer firing, a cross-executor
+        // call, or initial dispatch). Push to the shared queue and wake a parked
+        // worker so latency stays low; these are far rarer than re-schedules.
         self.0.injector.push(task);
-        // Only pay for an unpark if some worker is actually parked; busy workers
-        // will pick the task up via the injector on their next steal.
         if self.0.parked.load(Ordering::Acquire) > 0 {
             self.unpark_one();
         }
@@ -318,7 +335,7 @@ impl Executor {
     }
 }
 
-fn worker_loop(weak: Weak<Shared>, local: TaskDeque, idx: usize, id: usize) {
+fn worker_loop(shared: Arc<Shared>, local: TaskDeque, idx: usize, id: usize) {
     // Enter the shared reactor so leaf futures (timers/I/O) polled on this
     // thread register with it.
     let _enter = reactor().enter();
@@ -326,38 +343,22 @@ fn worker_loop(weak: Weak<Shared>, local: TaskDeque, idx: usize, id: usize) {
     // continuations locally. Cleared on exit.
     CURRENT_WORKER.with(|c| c.set(Some((id, &local as *const TaskDeque))));
     let _clear = ClearWorkerOnDrop;
-    loop {
-        let shared = match weak.upgrade() {
-            Some(s) => s,
-            None => break, // executor dropped
-        };
-        if shared.shutdown.load(Ordering::Acquire) {
-            break;
-        }
+    while !shared.shutdown.load(Ordering::Acquire) {
         match find_task(&local, &shared, idx) {
-            Some(task) => {
-                drop(shared);
-                run_task(task);
-            }
+            Some(task) => run_task(task),
             None => {
                 // Mark parked, then re-check for work to close the race with a
                 // concurrent inject that saw us as not-yet-parked.
                 shared.parked.fetch_add(1, Ordering::Release);
-                let task = find_task(&local, &shared, idx);
-                match task {
+                match find_task(&local, &shared, idx) {
                     Some(task) => {
                         shared.parked.fetch_sub(1, Ordering::Release);
-                        drop(shared);
                         run_task(task);
                     }
                     None => {
-                        drop(shared);
                         // Short timeout as a safety net against missed unparks.
                         std::thread::park_timeout(Duration::from_millis(1));
-                        // `shared` was dropped; re-acquire only to adjust count.
-                        if let Some(s) = weak.upgrade() {
-                            s.parked.fetch_sub(1, Ordering::Release);
-                        }
+                        shared.parked.fetch_sub(1, Ordering::Release);
                     }
                 }
             }
