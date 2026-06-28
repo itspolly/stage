@@ -52,6 +52,7 @@ mod context;
 mod executor;
 mod handle;
 
+use std::future::Future;
 use std::sync::{Arc, OnceLock};
 
 pub use context::ActorContext;
@@ -100,6 +101,38 @@ impl<A: Send + 'static> ActorRef<A> {
 pub fn default_executor() -> Executor {
     static DEFAULT: OnceLock<Executor> = OnceLock::new();
     DEFAULT.get_or_init(Executor::new).clone()
+}
+
+/// Run an arbitrary future as a continuation inside `actor`'s isolation domain.
+///
+/// The future is scheduled on `actor`'s cell exactly like an actor method: it
+/// runs under the actor's single token (so it is serialized with the actor's
+/// other continuations) and it is reentrant — at each `.await` it releases the
+/// token, letting other queued work for that actor run, and resumes later.
+///
+/// Unlike `#[stage::actor_fn]`, the future does **not** read or declare an
+/// `ActorContext`; it is an ordinary `async fn`/block that simply *runs on* the
+/// actor. That makes it a standalone function you can also call directly (just
+/// `.await` it) when you don't want it on an actor — "may run on an actor" is a
+/// decision made here, at the call site, not baked into the function.
+///
+/// ```ignore
+/// async fn double_after(x: usize) -> usize {
+///     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+///     x * 2
+/// }
+///
+/// let a = MyActor::spawn();
+/// let on_actor = stage::run_on(&a, double_after(21)).await; // runs on `a`
+/// let plain = double_after(21).await;                       // runs inline
+/// ```
+pub fn run_on<A, Fut, R>(actor: &ActorRef<A>, fut: Fut) -> JoinHandle<R>
+where
+    A: Send + 'static,
+    Fut: Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+{
+    __private::spawn_method(actor.cell.clone(), fut)
 }
 
 pub use stage_macros::{actor, actor_fn};
