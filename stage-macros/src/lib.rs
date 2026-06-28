@@ -5,7 +5,12 @@
 //!   an `ActorContext`-based body and generates the corresponding
 //!   `ActorRef<T>::method` that schedules it.
 //! * `#[stage::actor_fn]` turns a free `async fn(ctx: ActorContext<'_, A>, ..)`
-//!   into a schedulable helper invoked as `name(&actor_ref, ..)`.
+//!   into a schedulable helper invoked as `name(&actor_ref, ..)`. The helper may
+//!   take only `ctx`, and may be generic over the actor type
+//!   (`async fn helper<A: Trait>(ctx: ActorContext<'_, A>)`) so one helper can be
+//!   reused from multiple distinct actors. A first `ActorContext` parameter is
+//!   required — without it there is no actor to run on, so use a plain
+//!   `async fn`.
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
@@ -260,17 +265,26 @@ pub fn actor_fn(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
     let (typed, idents) = split_args(f.sig.inputs.iter().skip(1));
 
+    // Propagate the function's own generics + where-clause so a helper can be
+    // generic over the actor type, e.g. `async fn helper<A: SomeTrait>(ctx:
+    // ActorContext<'_, A>)`, and be invoked from multiple distinct actor types.
+    let (impl_generics, _ty_generics, where_clause) = f.sig.generics.split_for_impl();
+
     quote! {
         #[allow(unused, non_snake_case, clippy::all)]
-        #asyncness fn #lowered_name(#first_param, #(#typed),*) #ret #body
+        #asyncness fn #lowered_name #impl_generics (#first_param, #(#typed),*) #ret
+        #where_clause
+        #body
 
-        #vis fn #name(
+        #vis fn #name #impl_generics (
             __actor: &::stage::ActorRef<#actor_ty>,
             #(#typed),*
-        ) -> ::stage::JoinHandle<#ret_ty> {
+        ) -> ::stage::JoinHandle<#ret_ty>
+        #where_clause
+        {
             let __cell = ::stage::ActorRef::__cell(__actor);
             ::stage::__private::spawn_method(__cell, async move {
-                #lowered_name(::stage::__private::__ctx(), #(#idents),*).await
+                #lowered_name(::stage::__private::__ctx::<#actor_ty>(), #(#idents),*).await
             })
         }
     }
