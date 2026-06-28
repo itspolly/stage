@@ -9,10 +9,11 @@
 
 use proc_macro::TokenStream;
 use quote::{format_ident, quote};
+use std::collections::HashSet;
 use syn::visit_mut::VisitMut;
 use syn::{
-    parse_macro_input, FnArg, GenericArgument, Ident, ImplItem, ImplItemFn, Item, ItemFn,
-    ItemImpl, ItemStruct, Pat, PathArguments, ReturnType, Type,
+    parse_macro_input, parse_quote, Expr, FnArg, GenericArgument, Ident, ImplItem, ImplItemFn,
+    Item, ItemFn, ItemImpl, ItemStruct, Pat, PathArguments, ReturnType, Type,
 };
 
 #[proc_macro_attribute]
@@ -86,6 +87,17 @@ fn actor_impl(input: ItemImpl) -> TokenStream {
     // so it is automatically in scope for `counter.method()` calls there.
     let trait_ident = format_ident!("__StageMethods_{}", actor_ident);
 
+    // Names of async self-methods, so intra-actor `self.method().await` calls
+    // can be lowered to inline calls that continue in the same continuation.
+    let actor_methods: HashSet<String> = input
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            ImplItem::Fn(f) if is_actor_method(f) => Some(f.sig.ident.to_string()),
+            _ => None,
+        })
+        .collect();
+
     let mut lowered = Vec::new();
     let mut trait_sigs = Vec::new();
     let mut impl_methods = Vec::new();
@@ -94,7 +106,7 @@ fn actor_impl(input: ItemImpl) -> TokenStream {
     for item in &input.items {
         match item {
             ImplItem::Fn(f) if is_actor_method(f) => {
-                let (low, sig, m) = lower_method(self_ty, f);
+                let (low, sig, m) = lower_method(self_ty, f, &actor_methods);
                 lowered.push(low);
                 trait_sigs.push(sig);
                 impl_methods.push(m);
@@ -131,6 +143,7 @@ fn is_actor_method(f: &ImplItemFn) -> bool {
 fn lower_method(
     self_ty: &Type,
     f: &ImplItemFn,
+    actor_methods: &HashSet<String>,
 ) -> (
     proc_macro2::TokenStream,
     proc_macro2::TokenStream,
@@ -148,10 +161,14 @@ fn lower_method(
         ReturnType::Type(_, t) => quote! { #t },
     };
 
-    // Rewrite `self` -> the context handle in the body.
+    // Rewrite the body: `self.method(..)` for an async actor method becomes an
+    // inline call to the lowered associated fn (continues in this continuation);
+    // every other `self` becomes the context handle.
     let mut body = f.block.clone();
-    ReplaceSelf {
+    RewriteBody {
         ctx: ctx_ident.clone(),
+        self_ty: self_ty.clone(),
+        actor_methods,
     }
     .visit_block_mut(&mut body);
 
@@ -313,16 +330,50 @@ fn extract_actor_ty(ty: &Type) -> Option<Type> {
     None
 }
 
-/// Rewrites `self` expressions to the generated context identifier.
-struct ReplaceSelf {
+/// Rewrites an actor method body:
+///
+/// * `self.method(args)` where `method` is another async actor method becomes
+///   `<SelfTy>::__stage_method_method(__ctx(), args)` — a direct inline call
+///   that continues executing inside the *same* continuation (no new message,
+///   same actor token). When the inline call suspends, the whole continuation
+///   suspends and is resumed with the actor pointer re-published.
+/// * Every other `self` (field access, sync helper calls) becomes the context
+///   handle, which derefs to the actor.
+struct RewriteBody<'a> {
     ctx: Ident,
+    self_ty: Type,
+    actor_methods: &'a HashSet<String>,
 }
 
-impl VisitMut for ReplaceSelf {
-    fn visit_expr_path_mut(&mut self, ep: &mut syn::ExprPath) {
-        if ep.qself.is_none() && ep.path.is_ident("self") {
-            ep.path = syn::Path::from(self.ctx.clone());
+impl VisitMut for RewriteBody<'_> {
+    fn visit_expr_mut(&mut self, e: &mut Expr) {
+        match e {
+            // `self.method(args)` for an async actor method -> inline call.
+            Expr::MethodCall(mc)
+                if is_self_expr(&mc.receiver)
+                    && self.actor_methods.contains(&mc.method.to_string()) =>
+            {
+                let lowered = format_ident!("__stage_method_{}", mc.method);
+                let self_ty = self.self_ty.clone();
+                // Visit the args first so nested `self` uses are rewritten too.
+                let mut args = mc.args.clone();
+                for arg in args.iter_mut() {
+                    self.visit_expr_mut(arg);
+                }
+                *e = parse_quote! {
+                    <#self_ty>::#lowered(::stage::__private::__ctx(), #args)
+                };
+            }
+            // Bare `self` -> context handle.
+            Expr::Path(ep) if ep.qself.is_none() && ep.path.is_ident("self") => {
+                ep.path = syn::Path::from(self.ctx.clone());
+            }
+            _ => syn::visit_mut::visit_expr_mut(self, e),
         }
-        syn::visit_mut::visit_expr_path_mut(self, ep);
     }
+}
+
+/// Is this expression exactly `self`?
+fn is_self_expr(e: &Expr) -> bool {
+    matches!(e, Expr::Path(p) if p.qself.is_none() && p.path.is_ident("self"))
 }

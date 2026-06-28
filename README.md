@@ -151,9 +151,26 @@ These are deliberate, documented trade-offs of expressing Swift semantics in
    actor type, so an ordinary `async fn helper(c: &mut Counter)` cannot drive the
    actor and fails to compile (`tests/ui/ordinary_async_fn.rs`), steering the
    user toward `#[stage::actor_fn]`.
-7. **Intra-actor async `self`-calls are unsupported** (a method calling another
-   async method on `self`). Synchronous helper methods on the actor *are*
-   callable through the context's `Deref`.
+## Intra-actor calls
+
+A method may call another async method on `self`:
+
+```rust
+async fn compute(&mut self) -> usize {
+    self.value = 10;
+    let doubled = self.double().await; // continues in the *same* continuation
+    self.value = doubled;
+    doubled
+}
+```
+
+`self.double().await` is lowered to a **direct inline call** to the lowered
+associated function — it continues executing inside the *same* continuation,
+holding the same actor token (it is not a new scheduled message). If the inline
+call suspends, the whole continuation suspends, the token is released (so other
+queued methods may run reentrantly), and on resume the actor pointer is
+re-published. Synchronous helper methods are also callable directly through the
+context's `Deref`.
 
 ## Tests
 
