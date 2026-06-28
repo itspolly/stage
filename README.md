@@ -145,8 +145,14 @@ semantics in *safe, stable* Rust:
    actor's own module, so it is in scope automatically for `actor.method()`
    calls there. Calling from another module requires importing it.
 3. **Method parameters are by value** (e.g. `db: ActorRef<Database>`, not
-   `&ActorRef<Database>`). A continuation future must be `'static`, so it cannot
-   hold borrows across suspension. `ActorRef` is a cheap `Arc` clone.
+   `&ActorRef<Database>`). A continuation runs eagerly, may be detached, and
+   executes on the target actor's thread, so its future must be `'static` and
+   cannot hold borrows of the caller's frame across suspension. In practice this
+   is a non-issue: `ActorRef` is a cheap `Arc` clone, and any large value you'd
+   otherwise borrow can be passed as `Arc<T>` — a refcount bump, not a copy, so
+   it's zero-copy *sharing* (use `Arc<Mutex<T>>` if you also need to mutate it).
+   Note this restricts only invocation *parameters*; borrows of locals and of
+   `self` across `.await` inside a method body are fully supported.
 4. **`spawn()` requires `Default`.** Use `spawn_with(state)` to supply an initial
    value explicitly.
 5. **`ActorContext` is `Send`, but escape is still prevented** — see the
