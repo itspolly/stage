@@ -163,11 +163,12 @@ pub fn run_task(task: Arc<ContinuationTask>) {
     let waker = Waker::from(task.clone());
     let mut cx = Context::from_waker(&waker);
     let ptr = task.cell.state_ptr();
+    let type_id = task.cell.actor_type_id();
 
     let poll = {
-        // Publish the actor pointer for the duration of this poll so that any
-        // `ActorContext` deref resolves to it. Restored on drop / unwind.
-        let _scope = ActorScope::enter(ptr);
+        // Publish the actor (type tag + pointer) for the duration of this poll so
+        // any `ActorContext` deref resolves to it. Restored on drop / unwind.
+        let _scope = ActorScope::enter(type_id, ptr);
         let future = guard.as_mut().unwrap();
         catch_unwind(AssertUnwindSafe(|| future.as_mut().poll(&mut cx)))
     };

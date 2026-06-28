@@ -1,7 +1,8 @@
-//! # Stage — Swift-style reentrant actors for Rust
+//! # Stage — Reentrant actors for Rust
 //!
 //! Stage is a research prototype actor runtime whose defining property is
-//! **actor reentrancy**, modelled on Swift's actors:
+//! **actor reentrancy** (semantics inspired by Swift actors, implementation its
+//! own Rust execution model):
 //!
 //! * Only one continuation belonging to an actor executes at any instant
 //!   (isolation).

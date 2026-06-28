@@ -49,13 +49,17 @@ impl<A> ActorCell<A> {
 /// owning cell without carrying the actor type around.
 pub trait AnyCell: Send + Sync {
     fn state_ptr(&self) -> *mut ();
+    fn actor_type_id(&self) -> core::any::TypeId;
     fn sched(&self) -> &Mutex<CellSched>;
     fn executor(&self) -> &Executor;
 }
 
-impl<A: Send> AnyCell for ActorCell<A> {
+impl<A: Send + 'static> AnyCell for ActorCell<A> {
     fn state_ptr(&self) -> *mut () {
         self.state.get() as *mut ()
+    }
+    fn actor_type_id(&self) -> core::any::TypeId {
+        core::any::TypeId::of::<A>()
     }
     fn sched(&self) -> &Mutex<CellSched> {
         &self.sched

@@ -13,30 +13,31 @@
 
 use core::cell::Cell;
 use core::marker::PhantomData;
+use core::any::TypeId;
 use core::ops::{Deref, DerefMut};
-use core::ptr;
 
 thread_local! {
-    /// Pointer to the actor state currently being polled on this thread, or
-    /// null when no actor continuation is executing.
-    static CURRENT: Cell<*mut ()> = const { Cell::new(ptr::null_mut()) };
+    /// The actor currently being polled on this thread: its `TypeId` and a
+    /// pointer to its state. `None` when no actor continuation is executing.
+    ///
+    /// The `TypeId` lets a dereference verify it is reading the actor it was
+    /// created for. A stray context (escaped to another thread, or used after
+    /// its poll) therefore *panics* on deref rather than risking a type-confused
+    /// or dangling access — misuse is always safe, never UB.
+    static CURRENT: Cell<Option<(TypeId, *mut ())>> = const { Cell::new(None) };
 }
 
-/// RAII guard that publishes an actor pointer for the duration of one poll.
+/// RAII guard that publishes the current actor for the duration of one poll.
 ///
-/// On drop it restores the previous value, which keeps things correct even if a
-/// poll unwinds through a panic.
+/// On drop it restores the previous value, which keeps nested polls and
+/// panic-unwinds correct.
 pub(crate) struct ActorScope {
-    prev: *mut (),
+    prev: Option<(TypeId, *mut ())>,
 }
 
 impl ActorScope {
-    pub(crate) fn enter(ptr: *mut ()) -> Self {
-        let prev = CURRENT.with(|c| {
-            let prev = c.get();
-            c.set(ptr);
-            prev
-        });
+    pub(crate) fn enter(type_id: TypeId, ptr: *mut ()) -> Self {
+        let prev = CURRENT.with(|c| c.replace(Some((type_id, ptr))));
         ActorScope { prev }
     }
 }
@@ -83,37 +84,43 @@ impl<'a, A> ActorContext<'a, A> {
             _actor: PhantomData,
         }
     }
+}
 
+impl<'a, A: 'static> ActorContext<'a, A> {
+    /// Resolve the pointer to `A`'s state, verifying we are inside the poll of an
+    /// actor of type `A`. Panics (never UB) if the context is used outside its
+    /// poll or on the wrong actor.
     #[inline]
-    fn actor_ptr() -> *mut A {
-        let p = CURRENT.with(|c| c.get());
-        debug_assert!(
-            !p.is_null(),
-            "stage: ActorContext dereferenced outside of an actor poll; \
-             this usually means a context escaped its continuation"
-        );
-        p as *mut A
+    fn actor_ptr(&self) -> *mut A {
+        match CURRENT.with(|c| c.get()) {
+            Some((tid, p)) if tid == TypeId::of::<A>() => p as *mut A,
+            _ => panic!(
+                "stage: ActorContext used outside of its actor poll \
+                 (it must not escape its continuation or move to another thread)"
+            ),
+        }
     }
 }
 
-impl<'a, A> Deref for ActorContext<'a, A> {
+impl<'a, A: 'static> Deref for ActorContext<'a, A> {
     type Target = A;
 
     #[inline]
     fn deref(&self) -> &A {
-        // SAFETY: the runtime publishes a valid `*mut A` for the actor whose
-        // continuation is currently being polled, and guarantees that exactly
-        // one continuation of that actor runs at a time. The returned reference
-        // is bounded by `&self`, which cannot outlive the poll in practice.
-        unsafe { &*Self::actor_ptr() }
+        // SAFETY: `actor_ptr` verifies (via the thread-local TypeId tag) that we
+        // are inside the poll of an actor of type `A`, where the runtime has
+        // published a valid `*mut A`. The single-active-continuation-per-actor
+        // invariant guarantees no aliasing. The returned reference is bounded by
+        // `&self`, which cannot outlive the poll in practice.
+        unsafe { &*self.actor_ptr() }
     }
 }
 
-impl<'a, A> DerefMut for ActorContext<'a, A> {
+impl<'a, A: 'static> DerefMut for ActorContext<'a, A> {
     #[inline]
     fn deref_mut(&mut self) -> &mut A {
-        // SAFETY: see `Deref`. Exclusive access is upheld by the single-active-
+        // SAFETY: see `Deref`; exclusive access is upheld by the single-active-
         // continuation-per-actor scheduling invariant.
-        unsafe { &mut *Self::actor_ptr() }
+        unsafe { &mut *self.actor_ptr() }
     }
 }

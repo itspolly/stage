@@ -1,7 +1,7 @@
-# Stage — Swift-style reentrant actors for Rust
+# Stage — Reentrant actors for Rust
 
 Stage is a research prototype actor runtime for Rust whose defining property is
-**actor reentrancy**, modelled on Swift's actor model:
+**actor reentrancy**:
 
 * **Isolation** — only one continuation belonging to an actor executes at any
   instant; no data races.
@@ -11,6 +11,16 @@ Stage is a research prototype actor runtime for Rust whose defining property is
   from the suspension point with exclusive access to the actor.
 
 You write ordinary async methods on `&mut self`; Stage handles the rest.
+
+### Inspired by Swift actors
+
+The *semantics* are borrowed from Swift's actor model — isolation plus
+reentrancy at suspension points — but the implementation is its own thing. Stage
+is a Rust runtime with a Rust execution model: continuations (not actors) are the
+schedulable unit, a per-actor token enforces isolation, work stealing balances
+load, and a procedural macro lowers `&mut self` methods onto an `ActorContext`
+primitive. None of that mirrors Swift's internals; it's what falls out of doing
+this safely and idiomatically in Rust.
 
 ```rust
 #[stage::actor]
@@ -121,8 +131,8 @@ serve subsequent invocations. State mutated before the panic persists.
 
 ## Deviations from the brief (and why)
 
-These are deliberate, documented trade-offs of expressing Swift semantics in
-*safe, stable* Rust:
+These are deliberate, documented trade-offs of expressing reentrant-actor
+semantics in *safe, stable* Rust:
 
 1. **`#[stage::actor]` goes on both the struct and its impl block.** A proc-macro
    attribute can only observe the item it annotates. The struct attribute can't
@@ -139,12 +149,11 @@ These are deliberate, documented trade-offs of expressing Swift semantics in
    hold borrows across suspension. `ActorRef` is a cheap `Arc` clone.
 4. **`spawn()` requires `Default`.** Use `spawn_with(state)` to supply an initial
    value explicitly.
-5. **`ActorContext` safety is partly static, partly an invariant.** Statically
-   enforced: it cannot be cloned and cannot be constructed by users
-   (`tests/ui/`). Not statically enforced: it is `Send` (continuations migrate
-   threads, so everything they capture must be `Send`), so "cannot be sent to
-   another thread" is upheld by the runtime invariant (the thread-local is set
-   before every poll) rather than the type system.
+5. **`ActorContext` is `Send`, but escape is still prevented** — see the
+   Soundness section below. Briefly: it must be `Send` because continuations
+   migrate between worker threads, but its invariant lifetime stops it escaping
+   to a `'static` context at compile time, and a `TypeId`-tagged thread-local
+   makes any stray deref panic rather than risk UB.
 6. **Test 13's bespoke diagnostic is best-effort.** Stage cannot emit a custom
    message for an *un-annotated* ordinary async function it never sees. What it
    *can* enforce is that the reentrant methods live on `ActorRef`, not the bare
@@ -189,6 +198,65 @@ The suite in `stage/tests/` covers all 15 success criteria from the brief:
 cargo test            # run everything
 cargo clippy --all-targets
 ```
+
+## Soundness
+
+Stage uses `unsafe` in exactly one place: `ActorContext` re-derives `&mut A` from
+a thread-local raw pointer. Because that bypasses the borrow checker, the
+invariant becomes the heart of the library's soundness. Here is the argument.
+
+**Claim.** No safe use of Stage can produce a data race, a dangling reference, or
+a type-confused access through `ActorContext`.
+
+**The mechanism.** Before polling a continuation of actor `A`, the executor
+publishes `(TypeId::of::<A>(), *mut A)` into a thread-local and restores the
+previous value when the poll returns (an RAII guard, so it holds across panics
+too). `ActorContext::<A>::deref{,_mut}` reads the thread-local, checks the
+`TypeId`, and casts the pointer.
+
+1. **No two `&mut A` exist at once (isolation).** Each actor cell holds a single
+   `active` token. A continuation may be enqueued/polled only while holding it;
+   it is released on `Poll::Pending` or completion and handed to the next FIFO
+   continuation. So at most one continuation of `A` is ever being polled at any
+   instant, across all worker threads. A `deref_mut` only yields `&mut A` during
+   a poll, so two live `&mut A` for the same actor cannot coexist. The token is
+   guarded by a mutex, which also provides the happens-before edge when the token
+   (and thus the actor's state) migrates to another worker thread — so there is
+   no data race even though the state is touched from different threads over
+   time.
+
+2. **The pointer is always valid when read.** The thread-local is non-`None` only
+   for the dynamic extent of a poll, during which the executor holds the cell
+   alive (the continuation task holds an `Arc` to it) and the pointer addresses
+   live `UnsafeCell<A>` storage. The RAII guard restores the previous value on
+   the way out, including on unwind.
+
+3. **The pointer is never read for the wrong type or outside a poll.** Two
+   independent guards:
+   * *Compile time:* `ActorContext<'a, A>`'s lifetime `'a` is invariant and tied
+     to the poll, so safe code cannot move a context into a `'static` context
+     (a thread, a global, a detached future). `tests/ui/context_escape_thread.rs`
+     confirms the escape attempt fails to compile. It also cannot be cloned or
+     constructed by users (`tests/ui/`).
+   * *Run time (defense in depth):* every deref checks the thread-local `TypeId`
+     against `TypeId::of::<A>()`. If a context were ever observed outside the
+     poll of an actor of its type — e.g. an internal scheduling bug — the deref
+     **panics** instead of performing an invalid access. Misuse is therefore
+     always safe, never UB.
+
+4. **`Send` is required and does not weaken the above.** Continuations migrate
+   between worker threads, so the boxed future — and anything it captures,
+   including the (zero-sized) `ActorContext` — must be `Send`. Keeping the
+   `Fut: Send` bound on the spawn path is also a *feature*: it rejects actor
+   bodies that try to hold genuinely non-`Send` state (an `Rc`, etc.) across a
+   suspension. The cost is that `Send`-ness alone can't forbid moving a context
+   across threads — but points 3a (lifetime) and 3b (`TypeId` panic) cover that.
+
+**Residual assumptions.** The argument rests on the scheduler actually upholding
+the single-token invariant and setting the scope before every poll; those are
+ordinary (safe) code, exercised by the test suite (isolation, reentrancy,
+work-stealing, multi-executor, cancellation, panic). The `TypeId` guard turns any
+violation of the scope discipline into a panic rather than UB.
 
 ## Benchmarks
 

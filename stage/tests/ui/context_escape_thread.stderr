@@ -1,0 +1,14 @@
+error[E0521]: borrowed data escapes outside of function
+  --> tests/ui/context_escape_thread.rs:21:5
+   |
+19 |   #[stage::actor_fn]
+   |   ------------------ `ctx` is a reference that is only valid in the function body
+20 |   async fn escape(ctx: ActorContext<'_, Guarded>) {
+   |                                     -- let's call the lifetime of this reference `'1`
+21 | /     std::thread::spawn(move || {
+22 | |         let _escaped = ctx.n;
+23 | |     });
+   | |      ^
+   | |      |
+   | |______`ctx` escapes the function body here
+   |        argument requires that `'1` must outlive `'static`
