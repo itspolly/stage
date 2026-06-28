@@ -177,7 +177,12 @@ pub struct Executor(Arc<Shared>);
 struct Shared {
     injector: Injector<Arc<ContinuationTask>>,
     stealers: Vec<Stealer<Arc<ContinuationTask>>>,
-    threads: Mutex<Vec<Thread>>,
+    /// Worker thread handles for unparking. Written once, after spawn; read
+    /// lock-free on the hot inject path.
+    threads: OnceLock<Vec<Thread>>,
+    /// Number of workers currently parked, so inject can skip the unpark syscall
+    /// when everyone is already busy.
+    parked: AtomicUsize,
     next: AtomicUsize,
     shutdown: AtomicBool,
 }
@@ -197,8 +202,10 @@ impl Default for Executor {
 impl Drop for Shared {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
-        for t in self.threads.lock().iter() {
-            t.unpark();
+        if let Some(threads) = self.threads.get() {
+            for t in threads {
+                t.unpark();
+            }
         }
     }
 }
@@ -222,7 +229,8 @@ impl Executor {
         let shared = Arc::new(Shared {
             injector: Injector::new(),
             stealers,
-            threads: Mutex::new(Vec::new()),
+            threads: OnceLock::new(),
+            parked: AtomicUsize::new(0),
             next: AtomicUsize::new(0),
             shutdown: AtomicBool::new(false),
         });
@@ -236,19 +244,24 @@ impl Executor {
                 .expect("stage: failed to spawn worker thread");
             handles.push(handle.thread().clone());
         }
-        *shared.threads.lock() = handles;
+        let _ = shared.threads.set(handles);
 
         Executor(shared)
     }
 
-    /// Push a runnable continuation onto this executor and nudge a worker.
+    /// Push a runnable continuation onto this executor and nudge a parked worker.
     pub(crate) fn inject(&self, task: Arc<ContinuationTask>) {
         self.0.injector.push(task);
-        let n = self.0.stealers.len();
-        if n > 0 {
-            let i = self.0.next.fetch_add(1, Ordering::Relaxed) % n;
-            if let Some(t) = self.0.threads.lock().get(i) {
-                t.unpark();
+        // Only pay for an unpark if some worker is actually parked; busy workers
+        // will pick the task up via the injector on their next steal.
+        if self.0.parked.load(Ordering::Acquire) == 0 {
+            return;
+        }
+        if let Some(threads) = self.0.threads.get() {
+            let n = threads.len();
+            if n > 0 {
+                let i = self.0.next.fetch_add(1, Ordering::Relaxed) % n;
+                threads[i].unpark();
             }
         }
     }
@@ -272,10 +285,26 @@ fn worker_loop(weak: Weak<Shared>, local: Deque<Arc<ContinuationTask>>, idx: usi
                 run_task(task);
             }
             None => {
-                drop(shared);
-                // Park with a short timeout as a safety net against missed
-                // unparks; `inject` unparks us when work arrives.
-                std::thread::park_timeout(Duration::from_millis(1));
+                // Mark parked, then re-check for work to close the race with a
+                // concurrent inject that saw us as not-yet-parked.
+                shared.parked.fetch_add(1, Ordering::Release);
+                let task = find_task(&local, &shared, idx);
+                match task {
+                    Some(task) => {
+                        shared.parked.fetch_sub(1, Ordering::Release);
+                        drop(shared);
+                        run_task(task);
+                    }
+                    None => {
+                        drop(shared);
+                        // Short timeout as a safety net against missed unparks.
+                        std::thread::park_timeout(Duration::from_millis(1));
+                        // `shared` was dropped; re-acquire only to adjust count.
+                        if let Some(s) = weak.upgrade() {
+                            s.parked.fetch_sub(1, Ordering::Release);
+                        }
+                    }
+                }
             }
         }
     }
